@@ -1,0 +1,227 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+# parameters
+batch_size: int = 64
+block_size: int = 256
+max_iters: int = 500
+eval_interval: int = 500
+learning_rate: float = 3e-4
+device = 'mps' if torch.mps.is_available() else 'cpu'
+
+print(f"device: {device}")
+
+eval_iters = 200
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+
+
+torch.manual_seed(1337)
+
+
+with open('nano-gpt-karpathy/input.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+
+# character level tokenizers
+stoi = { ch:i for i,ch in enumerate(chars) }
+itos = { i:ch for i, ch in enumerate(chars) }
+
+# these are our tokenizers.
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
+
+
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9*len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+# the function that creates samples
+def get_batch(split):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x,y = x.to(device), y.to(device)
+    return x, y
+
+# the function to estimate the loss
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+
+# 1. Head
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        # these are the projections that produce the k, v and q
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        # this is needed for the decoder predictions
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        # this is just a dropout for better handling overfitting
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x) # (B, T, C)
+        q = self.query(x) # (B, T, C)
+
+        # here the q @ k.T will give the B, T, T
+        # and the C**-0.5 is the square root normalization so the distrubution will
+        # avoid skewness
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        # we are filling the triangular top matrix with -inf and by this we are masking the
+        # future. So the tokens from the past cant see the future.
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        # the softmax for the probabilities where the Head is checking which tokens where the
+        # most interesting and informative in order to generate this
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        v = self.value(x)
+        out = wei @ v # (B, T, C)
+        return out
+
+
+# we are feeding same thing into a multi heads, in our case its 6 if i remember correctly
+# and as i remember the heads attentions will get the implicit connections between
+# the tokens
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+
+# small neural network that has 2 fully connected layers with ReLU activation function
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        # here are the residual connections for the pre-norm, i dont really know why it works
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+class GenerativePretrainedTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f=nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+
+    def forward(self, idx, targets=None):
+        # we are taking batch and time from the context
+        B, T = idx.shape
+
+        # getting the embeddings of the tokens for our context
+        tok_emb = self.token_embedding_table(idx)
+        # getting the positions of the embedding, but im not sure what is going on here
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        # for the desired length of the tokens we are generating
+        for _ in range(max_new_tokens):
+            # not sure about this part, on one hand the idx is the context
+            # context is a [[0]] matrix, i guess its the first token id we are having
+            # maybe its like that because we are looking only at the last block_size sequence
+            # of tokens for the context and not the whole text (don't remember from the karpathy video)
+            idx_cond = idx[:, -block_size:]
+            # here we are creating logits for the sequence we have (our context)
+            logits, loss = self(idx_cond) # (B, T, vocab_size)
+            # it is the step that we need only the last token values
+            logits = logits[:, -1, :] # (B, last_element, vocab_size)
+            # we are getting the probabilities on the logits
+            probs = F.softmax(logits, dim=-1) #
+            # we are getting the token id for the next token
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # we are concatenating and out next context is the (1, len(idx) + 1, vocab_size)
+            idx = torch.cat((idx, idx_next), dim=1)
+        # returning the whole generated sequence
+        return idx
+
+model = GenerativePretrainedTransformer()
+m = model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# here is the model training loop
+for iter in range(max_iters):
+
+    if iter % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+    xb, yb = get_batch('train')
+
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+
+context = torch.zeros((1, 1), dtype = torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
