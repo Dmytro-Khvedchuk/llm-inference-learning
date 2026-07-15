@@ -4,11 +4,13 @@ from torch import Tensor
 import time
 import numpy as np
 
-model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+model_name: str = "Qwen/Qwen3-8B"
 
-model = AutoModelForCausalLM.from_pretrained(model_name)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"device: {device}")
+
+model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
 
 class GeneralLM:
     def __init__(
@@ -71,18 +73,25 @@ class LanguageModel(GeneralLM):
         self.output_sequence: list = []
         self.next_input = None
 
+        self.token_idx_sequence = []
+
         # performance metrics
         self.ttft: float = 0
         self.list_token_speeds: list[float] = []
 
         self.clock: int = time.CLOCK_MONOTONIC
 
-    def _prefill(self):
+    @torch.inference_mode()
+    def _prefill(self, use_cache: bool):
+
+        torch.cuda.synchronize()
         start: int = time.clock_gettime_ns(self.clock)
 
-        data = tokenizer(self.input_prompt, return_tensors="pt") # -> (46, 123, 5325)
+        data = tokenizer(self.input_prompt, return_tensors="pt").to(device) # -> (46, 123, 5325)
 
-        model_out = model(data.input_ids) # -> k, q, v
+        model_out = model(data.input_ids, use_cache=use_cache) # -> k, q, v
+
+        self.token_idx_sequence = data.input_ids
 
         self.logits = model_out.logits # logit -> 
 
@@ -91,20 +100,24 @@ class LanguageModel(GeneralLM):
 
         logits = self.logits[:, -1, :] # (Batch, Time, vocab_size)
         next_token = self.temperature_application(logits)
+        
         output = tokenizer.decode(next_token)
-
-        self.next_input = next_token
+    
         self.output_sequence = output
         
+        torch.cuda.synchronize()
         end: int = time.clock_gettime_ns(self.clock)
+        
+        self.next_input = next_token
         self.ttft: float = (end - start) / 1e9
 
-    def generate(self, tokens: int = 100) -> str:
+    @torch.inference_mode()
+    def generate(self, tokens: int = 100, warmup_mode: bool = False) -> str:
         if self.logits is None:
-            self._prefill()
-
+            self._prefill(self.use_cache)
         
         for _ in range(tokens):
+            torch.cuda.synchronize()
             start: int = time.clock_gettime_ns(self.clock)
             if self.use_cache:
                 model_out = model(
@@ -113,26 +126,41 @@ class LanguageModel(GeneralLM):
                 )
                 self.past_key_values = model_out.past_key_values
             else:
-                data = tokenizer(
-                    self.input_prompt + "".join(self.output_sequence), 
-                    return_tensors="pt"
-                )
-                model_out = model(data.input_ids)
+                model_out = model(self.token_idx_sequence, use_cache=False)
 
             self.logits = model_out.logits
             logits = self.logits[:, -1, :]
             next_token = self.temperature_application(logits)
 
             output = tokenizer.decode(next_token)
+
+            self.token_idx_sequence = torch.cat([self.token_idx_sequence, next_token], dim=-1)
+
             self.output_sequence += output
-            self.next_input = next_token
             
+            self.next_input = next_token
+            torch.cuda.synchronize()
             end: int = time.clock_gettime_ns(self.clock)
             self.list_token_speeds.append((end - start) / 1e9)
-            if next_token == tokenizer.eos_token_id:
-                break
 
-        return self.output_sequence
+        filling_var = self.output_sequence
+
+        if warmup_mode:
+            # internal variables
+            self.logits = None
+            self.past_key_values = None
+            self.output_sequence: list = []
+            self.next_input = None
+
+            self.token_idx_sequence = []
+
+            # performance metrics
+            self.ttft: float = 0
+            self.list_token_speeds: list[float] = []
+
+            self.clock: int = time.CLOCK_MONOTONIC
+
+        return filling_var
 
     def get_metrics(self):
         print(f"TTFT: {self.ttft} s")
@@ -142,7 +170,9 @@ class LanguageModel(GeneralLM):
         print(f"Total time: {np.sum(self.list_token_speeds)} s")
 
 
-input_prompt: str = "Here is the citation from the "
+input_prompt: str = """
+Now, I am going to count to 10000. 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+"""
 temperature_value: float = 0.8
 top_k: int = 5
 top_p: float = 0.7
@@ -155,19 +185,26 @@ kv_cache_model: LanguageModel = LanguageModel(
     use_cache=True,
 )
 
-no_cache_model: LanguageModel = LanguageModel(
-    input_prompt=input_prompt,
-    temperature_value=temperature_value,
-    top_value=top_k,
-    use_cache=False,
-)
-
-print(f"KV cache enabled model output: \n {"".join(kv_cache_model.generate(tokens=50))}")
-print("Metrics:")
-kv_cache_model.get_metrics()
+print(f"Warmup run: \n {"".join(kv_cache_model.generate(tokens=1024, warmup_mode=True))}")
 
 print(100 * "=")
 
-print(f"KV cache disabled model output: \n {"".join(no_cache_model.generate(tokens=50))}")
+print(f"KV cache enabled model output: \n {"".join(kv_cache_model.generate(tokens=1024))}")
 print("Metrics:")
-no_cache_model.get_metrics()
+kv_cache_model.get_metrics()
+
+# no_cache_model: LanguageModel = LanguageModel(
+#     input_prompt=input_prompt,
+#     temperature_value=temperature_value,
+#     top_value=top_k,
+#     use_cache=False,
+# )
+
+# print(f"Warmup run: \n {"".join(no_cache_model.generate(tokens=512, warmup_mode=True))}")
+
+# print(100 * "=")
+
+
+# print(f"KV cache disabled model output: \n {"".join(no_cache_model.generate(tokens=1024))}")
+# print("Metrics:")
+# no_cache_model.get_metrics()
