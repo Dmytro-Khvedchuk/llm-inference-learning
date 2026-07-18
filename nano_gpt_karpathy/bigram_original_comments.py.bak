@@ -90,7 +90,7 @@ class Head(nn.Module):
         # avoid skewness
         wei = q @ k.transpose(-2, -1) * C**-0.5
         # we are filling the triangular top matrix with -inf and by this we are masking the
-        # future. So the tokens from the past cant see the future. 
+        # future. So the tokens from the past cant see the future.
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         # the softmax for the probabilities where the Head is checking which tokens where the
         # most interesting and informative in order to generate this
@@ -187,7 +187,7 @@ class GenerativePretrainedTransformer(nn.Module):
         for _ in range(max_new_tokens):
             # not sure about this part, on one hand the idx is the context
             # context is a [[0]] matrix, i guess its the first token id we are having
-            # maybe its like that because we are looking only at the last block_size sequence 
+            # maybe its like that because we are looking only at the last block_size sequence
             # of tokens for the context and not the whole text (don't remember from the karpathy video)
             idx_cond = idx[:, -block_size:]
             # here we are creating logits for the sequence we have (our context)
@@ -197,7 +197,7 @@ class GenerativePretrainedTransformer(nn.Module):
             # we are getting the probabilities on the logits
             probs = F.softmax(logits, dim=-1) #
             # we are getting the token id for the next token
-            idx_next = torch.multinomial(probs, num_samples=1) 
+            idx_next = torch.multinomial(probs, num_samples=1)
             # we are concatenating and out next context is the (1, len(idx) + 1, vocab_size)
             idx = torch.cat((idx, idx_next), dim=1)
         # returning the whole generated sequence
@@ -225,5 +225,3 @@ for iter in range(max_iters):
 
 context = torch.zeros((1, 1), dtype = torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-
-
