@@ -16,3 +16,5 @@ venv/
 
 # Environment variables / secrets
 .env
+
+naive_hf_vs_vllm_benchmark/naive_hf_vs_vllm_benchmark_copy_from_vast
