@@ -18,3 +18,7 @@ venv/
 .env
 
 naive_hf_vs_vllm_benchmark/naive_hf_vs_vllm_benchmark_copy_from_vast
+
+# local AI-assisted session notes
+naive_hf_vs_vllm_benchmark/TODO.md
+naive_hf_vs_vllm_benchmark/artifacts/RESULTS_NOTES.md

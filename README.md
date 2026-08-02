@@ -22,7 +22,7 @@ The full method and analysis live in two posts:
 | Folder | What it is |
 |---|---|
 | `naive_hf_vs_vllm_benchmark/` | The benchmark harness: `hf_benchmark.py`, `vllm_benchmark.py`, `bandwidth_check.py` (measures achievable GDDR bandwidth — the floor denominator), `figures.py` |
-| `naive_hf_vs_vllm_benchmark/artifacts/` | Raw per-run JSONLs from the rental day + `RESULTS_NOTES.md` (measurement conditions) |
+| `naive_hf_vs_vllm_benchmark/artifacts/` | Raw per-run JSONLs from the rental day |
 | `naive_hf_vs_vllm_benchmark/figures/` | The plots used in the posts |
 | `decode_loop_from_scratch/` | Hand-written inference loop: prefill/decode split, KV-cache threading, sampling pipeline |
 | `nano_gpt_karpathy/` | Character-level GPT from scratch, following Karpathy |
